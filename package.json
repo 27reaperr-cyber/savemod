@@ -1,0 +1,20 @@
+{
+  "name": "savemod",
+  "version": "1.0.0",
+  "description": "SaveMOD — Telegram Business bot constructor + universal module (anti-delete, anti-edit, save disappearing media, dot-commands).",
+  "type": "module",
+  "scripts": {
+    "constructor": "node constructor.js",
+    "module": "node module.js",
+    "dev:constructor": "node --env-file=.env constructor.js",
+    "dev:module": "node --env-file=.env module.js"
+  },
+  "dependencies": {
+    "grammy": "^1.36.3",
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  }
+}
