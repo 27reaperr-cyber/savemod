@@ -1,11 +1,11 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  SaveMOD — Bot Constructor  (single-file)
+//  SaveMOD — Bot Constructor  (single-file, minimal)
 //  ───────────────────────────────────────────────────────────────────────────
-//  • grammY 1.36+   • better-sqlite3   • Bot API 9.6 «Managed Bots»
-//  • Inline-меню как на скриншотах (edit-in-place, без захламления чата)
-//  • Создание управляемых ботов через t.me/newbot/<manager>/<suggested>?name=
-//  • После создания — выдаём владельцу токен и записываем бота в БД,
-//    откуда module.js поднимет его как «дочерний» Business-бот.
+//  • grammY 1.36+ • better-sqlite3 • Bot API 9.6 «Managed Bots»
+//  • Минимализм: на /start — одна кнопка «🤖 Мои боты»
+//  • Премиум: 200⭐/мес — лимит до 10 ботов (без премиума — 5)
+//  • Обязательная подписка (настраивается в админ-панели)
+//  • Админ-панель: канал подписки, ссылки, статистика
 // ════════════════════════════════════════════════════════════════════════════
 
 import 'dotenv/config';
@@ -16,309 +16,363 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 // ─── 0. ENV ─────────────────────────────────────────────────────────────────
-const TOKEN       = process.env.CONSTRUCTOR_BOT_TOKEN;
-const MANAGER     = (process.env.CONSTRUCTOR_BOT_USERNAME || '').replace(/^@/, '');
-const DB_PATH     = process.env.CONSTRUCTOR_DB     || './constructor.db';
-const SUPPORT_URL = process.env.SUPPORT_CHANNEL    || 'https://t.me/savemod';
-const INSTR_URL   = process.env.INSTRUCTION_URL    || 'https://telegra.ph/SaveMOD';
+const TOKEN    = process.env.CONSTRUCTOR_BOT_TOKEN;
+const MANAGER  = (process.env.CONSTRUCTOR_BOT_USERNAME || '').replace(/^@/, '');
+const DB_PATH  = process.env.CONSTRUCTOR_DB || './constructor.db';
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',').map((s) => parseInt(s.trim(), 10)).filter(Boolean);
 
 if (!TOKEN)   throw new Error('CONSTRUCTOR_BOT_TOKEN is missing in .env');
 if (!MANAGER) throw new Error('CONSTRUCTOR_BOT_USERNAME is missing in .env');
+
+// Лимиты ботов
+const FREE_LIMIT    = 5;
+const PREMIUM_LIMIT = 10;
+const PREMIUM_PRICE = 200; // XTR (звёзды)
+const PREMIUM_DAYS  = 30;
+
+// Дефолты при создании бота
+const DEFAULT_BOT_NAME     = 'Save Bot';
+const DEFAULT_BOT_USERNAME = 'SaveBot';
 
 // ─── 1. DATABASE ────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
-    user_id     INTEGER PRIMARY KEY,
-    username    TEXT,
-    first_name  TEXT,
-    is_premium  INTEGER DEFAULT 0,
-    created_at  INTEGER NOT NULL
+    user_id        INTEGER PRIMARY KEY,
+    username       TEXT,
+    first_name     TEXT,
+    premium_until  INTEGER DEFAULT 0,
+    created_at     INTEGER NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS bots (
-    bot_id        INTEGER PRIMARY KEY,        -- Telegram user_id of created bot
+    bot_id        INTEGER PRIMARY KEY,
     owner_id      INTEGER NOT NULL,
     username      TEXT    NOT NULL UNIQUE,
     display_name  TEXT    NOT NULL,
-    token         TEXT,                       -- known after ManagedBotUpdated
-    members       INTEGER DEFAULT 0,          -- connected business accounts
+    token         TEXT,
+    members       INTEGER DEFAULT 0,
     enabled       INTEGER DEFAULT 1,
     created_at    INTEGER NOT NULL,
     FOREIGN KEY (owner_id) REFERENCES users(user_id)
   );
 
-  CREATE TABLE IF NOT EXISTS pending (        -- suggested-username flow
-    owner_id      INTEGER PRIMARY KEY,
-    suggested     TEXT NOT NULL,
-    display_name  TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS payments (
+    payload     TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    charge_id   TEXT,
+    stars       INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
   );
 `);
 
 const Q = {
   upsertUser: db.prepare(`
-    INSERT INTO users (user_id, username, first_name, is_premium, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO users (user_id, username, first_name, created_at)
+    VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
-      username = excluded.username,
-      first_name = excluded.first_name,
-      is_premium = excluded.is_premium`),
+      username   = excluded.username,
+      first_name = excluded.first_name`),
+  getUser:     db.prepare(`SELECT * FROM users WHERE user_id = ?`),
+  setPremium:  db.prepare(`UPDATE users SET premium_until = ? WHERE user_id = ?`),
+  countUsers:  db.prepare(`SELECT COUNT(*) AS c FROM users`),
+  countPremium: db.prepare(`SELECT COUNT(*) AS c FROM users WHERE premium_until > ?`),
+
   listBots:    db.prepare(`SELECT * FROM bots WHERE owner_id = ? ORDER BY created_at ASC`),
+  countBots:   db.prepare(`SELECT COUNT(*) AS c FROM bots WHERE owner_id = ?`),
+  countAllBots: db.prepare(`SELECT COUNT(*) AS c FROM bots`),
   getBot:      db.prepare(`SELECT * FROM bots WHERE bot_id = ?`),
   getBotByUsername: db.prepare(`SELECT * FROM bots WHERE username = ? COLLATE NOCASE`),
   insertBot:   db.prepare(`
     INSERT INTO bots (bot_id, owner_id, username, display_name, token, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(bot_id) DO UPDATE SET
-      token = excluded.token,
+      token        = excluded.token,
       display_name = excluded.display_name`),
   delBot:      db.prepare(`DELETE FROM bots WHERE bot_id = ? AND owner_id = ?`),
   toggleBot:   db.prepare(`UPDATE bots SET enabled = NOT enabled WHERE bot_id = ?`),
-  setPending:  db.prepare(`
-    INSERT INTO pending (owner_id, suggested, display_name, created_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(owner_id) DO UPDATE SET
-      suggested = excluded.suggested,
-      display_name = excluded.display_name,
-      created_at = excluded.created_at`),
-  getPending:  db.prepare(`SELECT * FROM pending WHERE owner_id = ?`),
-  delPending:  db.prepare(`DELETE FROM pending WHERE owner_id = ?`),
+
+  getSetting:  db.prepare(`SELECT value FROM settings WHERE key = ?`),
+  setSetting:  db.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
+
+  addPayment:  db.prepare(`
+    INSERT OR IGNORE INTO payments (payload, user_id, charge_id, stars, created_at)
+    VALUES (?, ?, ?, ?, ?)`),
 };
 
-// ─── 2. UI HELPERS ──────────────────────────────────────────────────────────
-const txt = {
-  brand: '🤖 *SaveMOD*',
-  greeting: (name) =>
-    `👋 *Привет, ${name}!*\n\n` +
-    `Я — *SaveMOD*, конструктор личных Telegram-ботов.\n` +
-    `С их помощью ты сможешь:\n\n` +
-    `• 🔔 получать уведомления, когда собеседник *удаляет* или *редактирует* сообщения;\n` +
-    `• 📸 сохранять *исчезающие* фото, голосовые и видео;\n` +
-    `• ⚙️ выполнять команды через точку \\(\\.help, \\.info …\\) прямо в чатах.\n\n` +
-    `Нажми «🤖 Мои боты», чтобы начать.`,
-  myBotsHeader: (count) =>
-    count === 0
-      ? `👾 *Ваши боты:*\n\n_У тебя пока нет ботов._\nНажми «➕ Добавить бота», чтобы создать первого.`
-      : `👾 *Ваши боты:*`,
-  botLine: (b) => `[@${escMd(b.username)}](https://t.me/${b.username}) — 👥 ${b.members}`,
-  createIntro:
-    `🆕 *Создание бота*\n\n` +
-    `SaveMOD предложит создать чат\\-бота и управлять им от твоего имени\\.\n\n` +
-    `Шаг 1️⃣ — придумай *@username* будущего бота \\(должен заканчиваться на \`bot\` или \`Bot\`, 5–32 символа\\)\\.\n\n` +
-    `Просто отправь желаемый username сообщением \\(например, \`MySaveBot\`\\)\\.`,
-  needUsername:
-    `Username должен:\n• заканчиваться на *bot*\n• быть длиной 5–32 символа\n• содержать только латиницу, цифры и \\_\n\nПопробуй ещё раз.`,
-  suggestName: (uname) =>
-    `✅ Username принят: \`@${escMd(uname)}\`\n\n` +
-    `Шаг 2️⃣ — напиши *отображаемое имя* бота \\(например, *SaveMOD 🤖*\\)\\.`,
-  ready: (uname, dname) =>
-    `🚀 *Готово к созданию*\n\n` +
-    `• Username: \`@${escMd(uname)}\`\n` +
-    `• Имя: *${escMd(dname)}*\n\n` +
-    `Нажми кнопку ниже — откроется системное окно Telegram для подтверждения создания\\.`,
-  navigationHelp:
-    `📜 *Описание команд*\n\n` +
-    `Команды вводятся в *обычных чатах* \\(не у меня\\) через точку\\.\n` +
-    `Например, отправь \`\\.help\` в любом диалоге — и подключённый бот ответит\\.\n\n` +
-    `Нажми на любую команду ниже, чтобы узнать подробности\\.`,
-  profile: (u, botsCnt) =>
-    `👤 *Профиль*\n\n` +
-    `• ID: \`${u.user_id}\`\n` +
-    `• Имя: ${escMd(u.first_name || '—')}\n` +
-    `• Username: ${u.username ? '@' + escMd(u.username) : '—'}\n` +
-    `• Telegram Premium: ${u.is_premium ? '✅' : '❌'}\n` +
-    `• Ботов создано: *${botsCnt}*`,
-  settings:
-    `⚙️ *Настройки*\n\n` +
-    `Здесь будут глобальные настройки уведомлений, языка и приватности\\.\n` +
-    `Каждый отдельный бот настраивается из его собственного меню\\.`,
-  premium:
-    `⭐ *Premium\\-доступ*\n\n` +
-    `Базовый функционал SaveMOD бесплатный\\.\n` +
-    `Premium открывает:\n• до 10 ботов одновременно\n• приоритетную скорость уведомлений\n• расширенный архив исчезающих медиа\n• кастомные команды через точку`,
-};
+// ─── 1.1 SETTINGS helpers ───────────────────────────────────────────────────
+function getSet(key, fallback = '') {
+  const r = Q.getSetting.get(key);
+  return r?.value ?? fallback;
+}
+function setSet(key, value) { Q.setSetting.run(key, String(value ?? '')); }
 
+// Инициализация дефолтных настроек
+const DEFAULTS = {
+  required_channel: '',                                  // напр. @savemod_channel или -100...
+  required_channel_url: '',                              // для кнопки «Подписаться»
+  instruction_url: 'https://telegra.ph/SaveMOD',
+  support_url:     'https://t.me/savemod',
+};
+for (const [k, v] of Object.entries(DEFAULTS)) {
+  if (Q.getSetting.get(k) == null) setSet(k, v);
+}
+
+// ─── 2. UTILS ───────────────────────────────────────────────────────────────
 function escMd(s = '') { return String(s).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, (m) => '\\' + m); }
+const isAdmin = (id) => ADMIN_IDS.includes(id);
+const isPremium = (u) => (u?.premium_until ?? 0) > Date.now();
+const limitOf   = (u) => (isPremium(u) ? PREMIUM_LIMIT : FREE_LIMIT);
 
+// ─── 3. KEYBOARDS ───────────────────────────────────────────────────────────
 const kb = {
-  main: () =>
-    new InlineKeyboard()
-      .text('🤖 Мои боты', 'menu:bots').row()
-      .text('👤 Профиль', 'menu:profile').text('⚙️ Настройки', 'menu:settings').row()
-      .url('📢 Канал', SUPPORT_URL).url('📋 Инструкция', INSTR_URL).row()
-      .text('⭐ Premium-доступ', 'menu:premium'),
+  start: (admin) => {
+    const k = new InlineKeyboard().text('🤖 Мои боты', 'menu:bots');
+    if (admin) k.row().text('🛠 Админ-панель', 'admin:home');
+    return k;
+  },
 
-  bots: (list) => {
+  bots: (list, user) => {
     const k = new InlineKeyboard();
     for (const b of list) {
-      k.text(`@${b.username} — 👥 ${b.members}`, `bot:${b.bot_id}`).row();
+      k.text(`${b.enabled ? '🟢' : '⚪️'} @${b.username}`, `bot:${b.bot_id}`).row();
     }
-    k.text('➕ Создать бота', 'bots:create').row();
-    k.text('🔗 Добавить существующего', 'bots:attach').row();
-    k.text('‹ Назад', 'menu:main');
+    const lim = limitOf(user);
+    if (list.length < lim) k.text('➕ Создать бота', 'bots:create').row();
+    k.text(`⭐ Премиум${isPremium(user) ? ' ✅' : ''}`, 'menu:premium').row();
+    k.text('‹ Назад', 'menu:home');
     return k;
   },
 
-  // BotAPI 9.6 «Managed bots»: t.me/newbot/<manager>/<suggested>?name=<...>
-  createConfirm: (suggested, displayName) => {
-    const url = `https://t.me/newbot/${encodeURIComponent(MANAGER)}/${encodeURIComponent(suggested)}` +
-                `?name=${encodeURIComponent(displayName)}`;
+  createConfirm: () => {
+    const url = `https://t.me/newbot/${encodeURIComponent(MANAGER)}/${encodeURIComponent(DEFAULT_BOT_USERNAME)}` +
+                `?name=${encodeURIComponent(DEFAULT_BOT_NAME)}`;
     return new InlineKeyboard()
-      .url('✨ Создать в Telegram', url).row()
-      .text('🔄 Изменить username', 'bots:create').row()
-      .text('‹ Отмена', 'menu:bots');
+      .url('✨ Создать бота', url).row()
+      .text('‹ Назад', 'menu:bots');
   },
 
-  back: (to = 'menu:main') => new InlineKeyboard().text('‹ Назад', to),
+  botCard: (b) => new InlineKeyboard()
+    .url('🔗 Открыть', `https://t.me/${b.username}`).row()
+    .text(b.enabled ? '⏸ Выключить' : '▶️ Включить', `bot:toggle:${b.bot_id}`).row()
+    .text('🗑 Удалить', `bot:delete:${b.bot_id}`).row()
+    .text('‹ Назад', 'menu:bots'),
 
-  botCard: (b) =>
-    new InlineKeyboard()
-      .url('🔗 Открыть в Telegram', `https://t.me/${b.username}`).row()
-      .text(b.enabled ? '⏸ Выключить' : '▶️ Включить', `bot:toggle:${b.bot_id}`).row()
-      .text('🗑 Удалить', `bot:delete:${b.bot_id}`).row()
-      .text('‹ Назад', 'menu:bots'),
-
-  // .-команды как на скрине №4
-  dotCommands: () => {
-    const cmds = [
-      '.afk','.clone','.crash','.cspam',
-      '.dice','.dox','.doxp','.dspam',
-      '.duel','.flip','.fv','.gifts',
-      '.gosu','.gp','.help','.info',
-      '.kawaii','.love','.lq','.mute',
-      '.nk','.send','.short','.spam',
-      '.status','.switch','.time','.troll',
-      '.ttt','.type','.unmute','.wspam',
-      '.yars','.zaebu',
-    ];
+  premium: (user) => {
     const k = new InlineKeyboard();
-    for (let i = 0; i < cmds.length; i += 4) {
-      const row = cmds.slice(i, i + 4);
-      for (const c of row) k.text(c, `cmd:${c.slice(1)}`);
-      k.row();
-    }
-    k.text('‹ Назад', 'menu:main');
+    if (!isPremium(user)) k.text(`Купить за ${PREMIUM_PRICE} ⭐ / ${PREMIUM_DAYS} дн.`, 'premium:buy').row();
+    k.text('‹ Назад', 'menu:home');
     return k;
   },
 
-  cmdInfo: (cmd) => new InlineKeyboard().text('‹ К командам', 'menu:cmds'),
+  subscribe: () => {
+    const url = getSet('required_channel_url') || getSet('required_channel');
+    const k = new InlineKeyboard();
+    if (url) k.url('📢 Подписаться', url).row();
+    k.text('✅ Я подписался', 'sub:check');
+    return k;
+  },
+
+  admin: () => new InlineKeyboard()
+    .text('📊 Статистика', 'admin:stats').row()
+    .text('📢 Канал подписки', 'admin:channel').row()
+    .text('🔗 Ссылки (инструкция / канал)', 'admin:links').row()
+    .text('‹ Назад', 'menu:home'),
+
+  adminBack: () => new InlineKeyboard().text('‹ Назад', 'admin:home'),
 };
 
-// Подробности .-команд (для модуля реализуем только .help, остальные — описание)
-const dotCmdDocs = {
-  help:    'Показывает в текущем чате список доступных точечных команд и краткую справку.',
-  afk:     'Включает режим «Отошёл» — бот авто-отвечает в чатах с указанной причиной.',
-  info:    'Выводит информацию о собеседнике (id, имя, регистрация).',
-  status:  'Показывает статус подключённого бизнес-бота: антиделит, сохранение медиа и т.д.',
-  time:    'Отправляет текущее время в чат.',
-  send:    'Отправляет в текущем чате текст от твоего имени с задержкой/анимацией.',
-  mute:    'Локально (для тебя) скрывает уведомления от собеседника.',
-  unmute:  'Возвращает уведомления от собеседника.',
+// ─── 4. TEXTS ───────────────────────────────────────────────────────────────
+const T = {
+  start: `Нажми «🤖 Мои боты», чтобы начать\\.`,
+  bots:  (list, user) => {
+    const lim = limitOf(user);
+    if (!list.length) return `*Мои боты* \\(0/${lim}\\)\n\n_Ботов пока нет_`;
+    const lines = list.map((b) => `• [@${escMd(b.username)}](https://t.me/${b.username}) — 👥 ${b.members}`);
+    return `*Мои боты* \\(${list.length}/${lim}\\)\n\n` + lines.join('\n');
+  },
+  createReady: `Нажми кнопку ниже — откроется системное окно Telegram\\.`,
+  botCard: (b) =>
+    `*${escMd(b.display_name)}*\n\n` +
+    `• [@${escMd(b.username)}](https://t.me/${b.username})\n` +
+    `• Статус: ${b.enabled ? '🟢 активен' : '⚪️ выключен'}\n` +
+    `• Подключений: ${b.members}`,
+  premium: (user) => {
+    if (isPremium(user)) {
+      const left = Math.ceil((user.premium_until - Date.now()) / 86_400_000);
+      return `⭐ *Премиум активен*\n\nОсталось дней: *${left}*\nЛимит ботов: *${PREMIUM_LIMIT}*`;
+    }
+    return `⭐ *Премиум*\n\n` +
+           `• Без премиума: до *${FREE_LIMIT}* ботов\n` +
+           `• С премиумом: до *${PREMIUM_LIMIT}* ботов, все команды\n\n` +
+           `Стоимость: *${PREMIUM_PRICE} ⭐ / ${PREMIUM_DAYS} дн\\.*`;
+  },
+  needSub: `Чтобы пользоваться ботом, подпишись на наш канал\\.`,
+  limitReached: (lim) => `Лимит ботов исчерпан \\(${lim}\\)\\.\nОформи ⭐ Премиум для расширения\\.`,
+  admin: `🛠 *Админ\\-панель*`,
+  adminStats: (s) =>
+    `📊 *Статистика*\n\n` +
+    `• Пользователей: *${s.users}*\n` +
+    `• Премиум: *${s.premium}*\n` +
+    `• Создано ботов: *${s.bots}*\n` +
+    `• Запущенных модулей: *${s.children}*`,
+  adminChannel: (ch, url) =>
+    `📢 *Канал обязательной подписки*\n\n` +
+    `Текущий: ${ch ? `\`${escMd(ch)}\`` : '_не задан_'}\n` +
+    `Ссылка: ${url ? `\`${escMd(url)}\`` : '_не задана_'}\n\n` +
+    `Отправь сообщение в формате:\n` +
+    `\`@channel | https://t.me/channel\`\n\n` +
+    `Чтобы отключить — отправь \`off\`\\.`,
+  adminLinks: (i, s) =>
+    `🔗 *Ссылки*\n\n` +
+    `• Инструкция: ${i ? `\`${escMd(i)}\`` : '_—_'}\n` +
+    `• Канал/Поддержка: ${s ? `\`${escMd(s)}\`` : '_—_'}\n\n` +
+    `Отправь сообщение в формате:\n` +
+    `\`instruction https://example.com\` или\n` +
+    `\`support https://t.me/channel\``,
 };
 
-// ─── 3. BOT ─────────────────────────────────────────────────────────────────
+// ─── 5. BOT ─────────────────────────────────────────────────────────────────
 const bot = new Bot(TOKEN);
 
-// Регистрация пользователя
+// Регистрация / обновление пользователя
 bot.use(async (ctx, next) => {
   if (ctx.from && !ctx.from.is_bot) {
-    Q.upsertUser.run(
-      ctx.from.id,
-      ctx.from.username || null,
-      ctx.from.first_name || null,
-      ctx.from.is_premium ? 1 : 0,
-      Date.now(),
-    );
+    Q.upsertUser.run(ctx.from.id, ctx.from.username || null, ctx.from.first_name || null, Date.now());
   }
   await next();
 });
 
-// ─── 3.1 /start ─────────────────────────────────────────────────────────────
+// In-memory состояние ввода для админа
+const adminInput = new Map(); // user_id → 'channel' | 'links'
+
+// ─── 5.1 Проверка подписки ─────────────────────────────────────────────────
+async function isSubscribed(ctx, uid) {
+  const ch = getSet('required_channel');
+  if (!ch) return true;
+  if (isAdmin(uid)) return true;
+  try {
+    const m = await ctx.api.getChatMember(ch, uid);
+    return ['creator', 'administrator', 'member'].includes(m.status);
+  } catch {
+    return true; // если бот не админ канала — не блокируем
+  }
+}
+
+// ─── 5.2 /start ─────────────────────────────────────────────────────────────
 bot.command('start', async (ctx) => {
-  const name = escMd(ctx.from?.first_name || 'друг');
-  await ctx.reply(txt.greeting(name), {
-    parse_mode: 'MarkdownV2',
-    reply_markup: kb.main(),
-  });
+  if (!(await isSubscribed(ctx, ctx.from.id))) {
+    return ctx.reply(T.needSub, { parse_mode: 'MarkdownV2', reply_markup: kb.subscribe() });
+  }
+  await ctx.reply(T.start, { parse_mode: 'MarkdownV2', reply_markup: kb.start(isAdmin(ctx.from.id)) });
 });
 
-// ─── 3.2 Universal callback router ──────────────────────────────────────────
+// ─── 5.3 Callback router ────────────────────────────────────────────────────
 bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data;
   try {
-    if (data === 'menu:main')      return showMain(ctx);
-    if (data === 'menu:bots')      return showBots(ctx);
-    if (data === 'menu:profile')   return showProfile(ctx);
-    if (data === 'menu:settings')  return editText(ctx, txt.settings, kb.back());
-    if (data === 'menu:premium')   return editText(ctx, txt.premium,  kb.back());
-    if (data === 'menu:cmds')      return editText(ctx, txt.navigationHelp, kb.dotCommands());
+    // Проверка подписки на всех роутах кроме самой проверки
+    if (data !== 'sub:check' && !(await isSubscribed(ctx, ctx.from.id))) {
+      return editText(ctx, T.needSub, kb.subscribe());
+    }
 
-    if (data === 'bots:create')    return startCreateFlow(ctx);
-    if (data === 'bots:attach')    return promptAttach(ctx);
+    if (data === 'sub:check') {
+      if (await isSubscribed(ctx, ctx.from.id)) {
+        return editText(ctx, T.start, kb.start(isAdmin(ctx.from.id)));
+      }
+      return ctx.answerCallbackQuery({ text: 'Подписка не найдена', show_alert: true });
+    }
+
+    if (data === 'menu:home')    return editText(ctx, T.start, kb.start(isAdmin(ctx.from.id)));
+    if (data === 'menu:bots')    return showBots(ctx);
+    if (data === 'menu:premium') return showPremium(ctx);
+
+    if (data === 'bots:create') return startCreate(ctx);
+    if (data === 'premium:buy') return sendInvoice(ctx);
 
     if (data.startsWith('bot:toggle:')) return toggleBot(ctx, +data.split(':')[2]);
     if (data.startsWith('bot:delete:')) return deleteBot(ctx, +data.split(':')[2]);
     if (data.startsWith('bot:'))        return showBotCard(ctx, +data.split(':')[1]);
 
-    if (data.startsWith('cmd:')) {
-      const cmd = data.slice(4);
-      const desc = dotCmdDocs[cmd] || 'Команда зарезервирована, описание появится позже.';
-      return editText(ctx, `*\\.${escMd(cmd)}*\n\n${escMd(desc)}`, kb.cmdInfo(cmd));
-    }
+    if (data === 'admin:home' && isAdmin(ctx.from.id))    return editText(ctx, T.admin, kb.admin());
+    if (data === 'admin:stats' && isAdmin(ctx.from.id))   return showAdminStats(ctx);
+    if (data === 'admin:channel' && isAdmin(ctx.from.id)) return showAdminChannel(ctx);
+    if (data === 'admin:links' && isAdmin(ctx.from.id))   return showAdminLinks(ctx);
 
     await ctx.answerCallbackQuery();
   } catch (err) {
     console.error('[callback]', err);
-    await ctx.answerCallbackQuery({ text: 'Ошибка, попробуй ещё раз', show_alert: false }).catch(() => {});
+    await ctx.answerCallbackQuery({ text: 'Ошибка, попробуйте ещё раз' }).catch(() => {});
   }
 });
 
-// ─── 3.3 Text handler — этапы создания бота ─────────────────────────────────
+// ─── 5.4 Admin text input ───────────────────────────────────────────────────
 bot.on('message:text', async (ctx) => {
-  if (ctx.msg.text.startsWith('/')) return; // другие команды
+  if (ctx.msg.text.startsWith('/')) return;
 
-  const pending = Q.getPending.get(ctx.from.id);
-  if (!pending) return;
+  const uid = ctx.from.id;
+  const mode = adminInput.get(uid);
 
-  // Этап 1: ждём username
-  if (!pending.suggested || pending.suggested === '__WAIT_USERNAME__') {
-    const uname = ctx.msg.text.trim().replace(/^@/, '');
-    if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(uname) || !/bot$/i.test(uname)) {
-      return ctx.reply(txt.needUsername, { parse_mode: 'MarkdownV2' });
-    }
-    if (Q.getBotByUsername.get(uname)) {
-      return ctx.reply('⚠️ Этот username уже занят в нашей базе. Попробуй другой.');
-    }
-    Q.setPending.run(ctx.from.id, uname, '__WAIT_NAME__', Date.now());
-    return ctx.reply(txt.suggestName(uname), { parse_mode: 'MarkdownV2' });
+  // Привязка существующего бота по токену
+  if (/^\d{6,}:[A-Za-z0-9_-]{20,}$/.test(ctx.msg.text.trim())) {
+    return attachByToken(ctx, ctx.msg.text.trim());
   }
 
-  // Этап 2: ждём display name
-  if (pending.display_name === '__WAIT_NAME__') {
-    const dname = ctx.msg.text.trim().slice(0, 64);
-    if (dname.length < 1) return ctx.reply('Имя слишком короткое.');
-    Q.setPending.run(ctx.from.id, pending.suggested, dname, Date.now());
-    return ctx.reply(txt.ready(pending.suggested, dname), {
-      parse_mode: 'MarkdownV2',
-      reply_markup: kb.createConfirm(pending.suggested, dname),
-    });
+  if (!mode || !isAdmin(uid)) return;
+
+  const text = ctx.msg.text.trim();
+
+  if (mode === 'channel') {
+    if (text.toLowerCase() === 'off') {
+      setSet('required_channel', '');
+      setSet('required_channel_url', '');
+      adminInput.delete(uid);
+      return ctx.reply('✅ Обязательная подписка отключена.');
+    }
+    const parts = text.split('|').map((s) => s.trim());
+    const ch  = parts[0];
+    const url = parts[1] || '';
+    if (!ch) return ctx.reply('Неверный формат. Пример: @channel | https://t.me/channel');
+    setSet('required_channel', ch);
+    setSet('required_channel_url', url);
+    adminInput.delete(uid);
+    return ctx.reply(`✅ Канал установлен: ${ch}`);
+  }
+
+  if (mode === 'links') {
+    const [key, ...rest] = text.split(/\s+/);
+    const val = rest.join(' ').trim();
+    if (key === 'instruction' && val) {
+      setSet('instruction_url', val);
+      adminInput.delete(uid);
+      return ctx.reply(`✅ Инструкция: ${val}`);
+    }
+    if (key === 'support' && val) {
+      setSet('support_url', val);
+      adminInput.delete(uid);
+      return ctx.reply(`✅ Поддержка/канал: ${val}`);
+    }
+    return ctx.reply('Неверный формат. Пример: instruction https://example.com');
   }
 });
 
-// ─── 3.4 Managed-bot updates (Bot API 9.6) ─────────────────────────────────
-// Когда пользователь подтвердил создание в системном окне Telegram,
-// нам прилетает update.managed_bot с токеном свежесозданного бота.
-// grammY ещё не имеет именованного хэндлера → ловим на сыром уровне.
+// ─── 5.5 Managed-bot updates (Bot API 9.6) ─────────────────────────────────
 bot.use(async (ctx, next) => {
   const u = ctx.update;
   if (u.managed_bot) {
     await handleManagedBotUpdated(u.managed_bot, ctx);
     return;
   }
-  // Также возможно сообщение типа managed_bot_created в чате-конструкторе
-  if (ctx.msg && ctx.msg.managed_bot_created) {
+  if (ctx.msg?.managed_bot_created) {
     await handleManagedBotCreated(ctx.msg.managed_bot_created, ctx);
     return;
   }
@@ -331,39 +385,47 @@ async function handleManagedBotUpdated(mbu, ctx) {
   const token   = mbu.token;
   if (!b || !ownerId) return;
 
+  // Проверяем лимит на момент создания
+  const user = Q.getUser.get(ownerId);
+  const cnt  = Q.countBots.get(ownerId).c;
+  if (cnt >= limitOf(user)) {
+    return ctx.api.sendMessage(ownerId,
+      `⚠️ Лимит ботов исчерпан (${limitOf(user)}). Оформи Премиум для расширения.`).catch(() => {});
+  }
+
   Q.insertBot.run(b.id, ownerId, b.username, b.first_name || b.username, token || null, Date.now());
-  Q.delPending.run(ownerId);
 
   await ctx.api.sendMessage(
     ownerId,
     `🎉 *Бот создан\\!*\n\n` +
     `• [@${escMd(b.username)}](https://t.me/${b.username})\n` +
     `• Имя: *${escMd(b.first_name || b.username)}*\n\n` +
-    `Я только что подключил к нему *модуль SaveMOD* — теперь он умеет всё, ` +
-    `что обещано на главной\\. Перейди в @${escMd(b.username)} и нажми «Скопировать @username», ` +
-    `чтобы подключить его к своему Telegram Business\\.`,
-    { parse_mode: 'MarkdownV2' },
-  );
+    `Перейди в [@${escMd(b.username)}](https://t.me/${b.username}) и нажми \\/start\\.`,
+    { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } },
+  ).catch(() => {});
 
-  // Поднимаем дочерний процесс с модулем для этого бота
   spawnModuleFor(b.username, token);
 }
 
 async function handleManagedBotCreated(mbc, ctx) {
-  // Резервный путь: запись о создании пришла как Message.managed_bot_created
   if (!mbc?.bot) return;
   Q.insertBot.run(mbc.bot.id, ctx.from.id, mbc.bot.username,
                   mbc.bot.first_name || mbc.bot.username, null, Date.now());
 }
 
-// ─── 3.5 Менеджер дочерних модулей ─────────────────────────────────────────
+// ─── 5.6 Children processes manager ─────────────────────────────────────────
 const children = new Map(); // username → ChildProcess
 function spawnModuleFor(username, token) {
   if (!token) return;
   if (children.has(username)) return;
   const here = path.dirname(fileURLToPath(import.meta.url));
   const child = spawn(process.execPath, [path.join(here, 'module.js')], {
-    env: { ...process.env, MODULE_BOT_TOKEN: token, MODULE_BOT_USERNAME: username },
+    env: {
+      ...process.env,
+      MODULE_BOT_TOKEN: token,
+      MODULE_BOT_USERNAME: username,
+      CONSTRUCTOR_DB: DB_PATH,        // модуль читает премиум-статус из общей БД
+    },
     stdio: 'inherit',
   });
   children.set(username, child);
@@ -373,33 +435,34 @@ function spawnModuleFor(username, token) {
   });
 }
 
-// При старте конструктора поднимаем все ранее созданные модули
+// Поднимаем при старте
 for (const b of db.prepare(`SELECT * FROM bots WHERE token IS NOT NULL AND enabled = 1`).all()) {
   spawnModuleFor(b.username, b.token);
 }
 
-// ─── 4. SCREEN BUILDERS ─────────────────────────────────────────────────────
+// ─── 6. SCREENS ─────────────────────────────────────────────────────────────
 async function editText(ctx, text, reply_markup) {
   try {
-    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup });
+    await ctx.editMessageText(text, {
+      parse_mode: 'MarkdownV2',
+      reply_markup,
+      link_preview_options: { is_disabled: true },
+    });
   } catch (err) {
-    if (err instanceof GrammyError && err.description?.includes('not modified')) return;
-    // Если редактировать нельзя (например, сообщение слишком старое) — отправим новое
-    await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup });
+    if (err instanceof GrammyError && /not modified/.test(err.description || '')) {
+      // ok
+    } else {
+      await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup,
+        link_preview_options: { is_disabled: true } }).catch(() => {});
+    }
   }
   await ctx.answerCallbackQuery().catch(() => {});
 }
 
-async function showMain(ctx) {
-  const name = escMd(ctx.from?.first_name || 'друг');
-  return editText(ctx, txt.greeting(name), kb.main());
-}
-
 async function showBots(ctx) {
+  const user = Q.getUser.get(ctx.from.id);
   const list = Q.listBots.all(ctx.from.id);
-  let body = txt.myBotsHeader(list.length);
-  if (list.length) body += '\n\n' + list.map(txt.botLine).join('\n');
-  return editText(ctx, body, kb.bots(list));
+  return editText(ctx, T.bots(list, user), kb.bots(list, user));
 }
 
 async function showBotCard(ctx, botId) {
@@ -407,34 +470,19 @@ async function showBotCard(ctx, botId) {
   if (!b || b.owner_id !== ctx.from.id) {
     return ctx.answerCallbackQuery({ text: 'Бот не найден', show_alert: true });
   }
-  const body =
-    `🤖 *${escMd(b.display_name)}*\n\n` +
-    `• Username: [@${escMd(b.username)}](https://t.me/${b.username})\n` +
-    `• Подключений: 👥 *${b.members}*\n` +
-    `• Статус: ${b.enabled ? '🟢 активен' : '⚪️ выключен'}\n` +
-    `• Токен: ${b.token ? '🔑 получен' : '⌛ ожидание'}`;
-  return editText(ctx, body, kb.botCard(b));
+  return editText(ctx, T.botCard(b), kb.botCard(b));
 }
 
-async function showProfile(ctx) {
-  const u = db.prepare(`SELECT * FROM users WHERE user_id = ?`).get(ctx.from.id);
-  const cnt = Q.listBots.all(ctx.from.id).length;
-  return editText(ctx, txt.profile(u, cnt), kb.back());
-}
-
-async function startCreateFlow(ctx) {
-  Q.setPending.run(ctx.from.id, '__WAIT_USERNAME__', '__WAIT_USERNAME__', Date.now());
-  return editText(ctx, txt.createIntro, new InlineKeyboard().text('‹ Отмена', 'menu:bots'));
-}
-
-async function promptAttach(ctx) {
-  return editText(
-    ctx,
-    `🔗 *Привязка существующего бота*\n\n` +
-    `Пришли мне токен бота из @BotFather одним сообщением \\(формат \`123456:AA…\`\\)\\.\n` +
-    `Я подключу к нему модуль SaveMOD\\.`,
-    new InlineKeyboard().text('‹ Отмена', 'menu:bots'),
-  );
+async function startCreate(ctx) {
+  const user = Q.getUser.get(ctx.from.id);
+  const cnt  = Q.countBots.get(ctx.from.id).c;
+  const lim  = limitOf(user);
+  if (cnt >= lim) {
+    return editText(ctx, T.limitReached(lim), new InlineKeyboard()
+      .text('⭐ Премиум', 'menu:premium').row()
+      .text('‹ Назад', 'menu:bots'));
+  }
+  return editText(ctx, T.createReady, kb.createConfirm());
 }
 
 async function toggleBot(ctx, id) {
@@ -456,34 +504,102 @@ async function deleteBot(ctx, id) {
   return showBots(ctx);
 }
 
-// Обработка токенов «привязки» (одним сообщением)
-bot.hears(/^\d{6,}:[A-Za-z0-9_-]{20,}$/, async (ctx) => {
-  const token = ctx.msg.text.trim();
-  // Получаем username через getMe «временного» бота
+async function attachByToken(ctx, token) {
   try {
     const probe = new Bot(token);
     const me = await probe.api.getMe();
+    const user = Q.getUser.get(ctx.from.id);
+    const cnt  = Q.countBots.get(ctx.from.id).c;
+    if (cnt >= limitOf(user)) {
+      return ctx.reply(`Лимит ${limitOf(user)} ботов исчерпан.`);
+    }
     Q.insertBot.run(me.id, ctx.from.id, me.username, me.first_name || me.username, token, Date.now());
     spawnModuleFor(me.username, token);
-    await ctx.reply(`✅ Подключено: @${me.username}`);
-    await showBots(ctx).catch(() => {});
-  } catch (e) {
-    await ctx.reply('❌ Токен невалиден или бот недоступен.');
+    await ctx.reply(`✅ Подключён: @${me.username}`);
+  } catch {
+    await ctx.reply('❌ Токен невалиден.');
   }
+}
+
+// ─── 7. PREMIUM (Telegram Stars) ───────────────────────────────────────────
+async function showPremium(ctx) {
+  const user = Q.getUser.get(ctx.from.id);
+  return editText(ctx, T.premium(user), kb.premium(user));
+}
+
+async function sendInvoice(ctx) {
+  const payload = `prem_${ctx.from.id}_${Date.now()}`;
+  await ctx.answerCallbackQuery().catch(() => {});
+  await ctx.api.sendInvoice(
+    ctx.from.id,
+    'SaveMOD Премиум',
+    `Премиум-доступ на ${PREMIUM_DAYS} дней: до ${PREMIUM_LIMIT} ботов и все команды.`,
+    payload,
+    'XTR',                                       // Telegram Stars
+    [{ label: 'Премиум', amount: PREMIUM_PRICE }],
+  ).catch((e) => {
+    console.error('[invoice]', e);
+    ctx.reply('Не удалось создать счёт, попробуйте позже.').catch(() => {});
+  });
+}
+
+bot.on('pre_checkout_query', async (ctx) => {
+  await ctx.answerPreCheckoutQuery(true).catch(() => {});
 });
 
-// ─── 5. ERROR-BOUNDARY ─────────────────────────────────────────────────────
+bot.on('message:successful_payment', async (ctx) => {
+  const sp = ctx.msg.successful_payment;
+  const uid = ctx.from.id;
+  const user = Q.getUser.get(uid);
+  const base = Math.max(user?.premium_until ?? 0, Date.now());
+  const newUntil = base + PREMIUM_DAYS * 86_400_000;
+  Q.setPremium.run(newUntil, uid);
+  Q.addPayment.run(sp.invoice_payload, uid, sp.telegram_payment_charge_id, sp.total_amount, Date.now());
+  await ctx.reply(`✅ Премиум активирован до ${new Date(newUntil).toLocaleDateString('ru-RU')}.`);
+});
+
+// ─── 8. ADMIN PANEL ────────────────────────────────────────────────────────
+async function showAdminStats(ctx) {
+  const stats = {
+    users:    Q.countUsers.get().c,
+    premium:  Q.countPremium.get(Date.now()).c,
+    bots:     Q.countAllBots.get().c,
+    children: children.size,
+  };
+  return editText(ctx, T.adminStats(stats), kb.adminBack());
+}
+
+async function showAdminChannel(ctx) {
+  adminInput.set(ctx.from.id, 'channel');
+  return editText(
+    ctx,
+    T.adminChannel(getSet('required_channel'), getSet('required_channel_url')),
+    kb.adminBack(),
+  );
+}
+
+async function showAdminLinks(ctx) {
+  adminInput.set(ctx.from.id, 'links');
+  return editText(
+    ctx,
+    T.adminLinks(getSet('instruction_url'), getSet('support_url')),
+    kb.adminBack(),
+  );
+}
+
+// ─── 9. ERROR BOUNDARY ─────────────────────────────────────────────────────
 bot.catch((err) => {
-  if (err.error instanceof HttpError)   console.error('[net]', err.error);
+  if (err.error instanceof HttpError)        console.error('[net]', err.error);
   else if (err.error instanceof GrammyError) console.error('[tg]', err.error.description);
   else console.error('[bot]', err.error);
 });
 
-// ─── 6. START ──────────────────────────────────────────────────────────────
+// ─── 10. START ─────────────────────────────────────────────────────────────
 const ALLOWED = [
   'message', 'edited_message', 'callback_query',
+  'pre_checkout_query',
   'business_connection', 'business_message', 'edited_business_message', 'deleted_business_messages',
-  'managed_bot', // BotAPI 9.6
+  'managed_bot',
 ];
 
 bot.start({
@@ -492,6 +608,11 @@ bot.start({
 });
 
 // graceful shutdown
-const stop = (sig) => { console.log(`\n[${sig}] shutting down…`); bot.stop(); for (const c of children.values()) c.kill(); process.exit(0); };
-process.once('SIGINT', () => stop('SIGINT'));
+const stop = (sig) => {
+  console.log(`\n[${sig}] shutting down…`);
+  bot.stop();
+  for (const c of children.values()) { try { c.kill(); } catch {} }
+  process.exit(0);
+};
+process.once('SIGINT',  () => stop('SIGINT'));
 process.once('SIGTERM', () => stop('SIGTERM'));
